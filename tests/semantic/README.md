@@ -3,7 +3,7 @@
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
 ```sh
-python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 26 s instead of 253 s on 16 cores
+python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 297 s instead of 2 401 s on 16 cores (Windows 11)
 python -m unittest discover -s tests/semantic -v             # the same tests, one file after another
 python -I scripts/run_semantic_tests.py tests/semantic -j 4 -p 'test_image_*.py'  # a matching subset
 ```
@@ -64,7 +64,7 @@ instruction family per file; the list below describes some of them, not every fi
   whose format differs from the instruction's, or is 0) and asserts the 52 words `check.py` expects, measured natively on a
   Radeon 680M; also the default `BUF_FMT_8_UNORM` byte, a format without an encoder staying `Unsupported`, and the
   store's data VGPRs counting as reads.
-- `test_buffer_formats_all.py` runs `buffer_load_format_xyzw` (through the V# and through tbuffer) and `buffer_store_format_xyzw` of the 33 formats
+- `test_buffer_formats_all.py` runs `buffer_load_format_xyzw` (through the V# and through tbuffer) and `buffer_store_format_xyzw` of the 45 formats
   the SCALED, SINT, 10_11_11 / 11_11_10 FLOAT, 2_10_10_10 and 10_10_10_2 families added, with edge values, NaN, infinity and denormals, against
   `tools/buffer_format_fuzz.py`'s model, which the Radeon 880M reproduced for 1.33 million validated elements (docs/buffer_formats.md). Two stores of
   older formats that differ from the hardware are pinned as expected failures.

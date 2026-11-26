@@ -9,11 +9,12 @@ issue][claims] helps more.
 
 This page collects the setup steps and the problems testers have run into so far.
 
-[claims]: https://github.com/ubiquitarianism/leonida/issues/14
+[claims]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## What you need
 
-- **Python 3.11+.** `scripts/run_gpu_tests.py` needs at least 3.10.
+- **Python 3.12+**, which `make_game.py` requires (it stops with "Python 3.12 or newer is needed" on an older one, so
+  its tests fail there too). `scripts/run_gpu_tests.py` on its own runs on 3.10 or newer.
 - **`llvm-mc` with the AMDGPU target** (LLVM 21+). The official LLVM Windows release has no AMDGPU target. On
   Windows, use one of:
   - `scripts\build_llvm_mc.ps1`, which builds a native `llvm-mc.exe` (needs git and the Visual Studio C++ tools);
@@ -56,9 +57,9 @@ This page collects the setup steps and the problems testers have run into so far
 
 ## Build the test programs
 
-On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_m2_textured`,
-`d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and `d3d12_buffer_uav` when it finds `llvm-mc`,
-`spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
+On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_rect_list`,
+`d3d12_quad_index`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and
+`d3d12_buffer_uav` when it finds `llvm-mc`, `spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
 Without `glslangValidator`, other tests are also omitted, including `d3d12_compute`, `d3d12_draw`,
 `d3d12_set0_compute` and `d3d12_mesh`; some registered tests run only part of their checks. These tests can be
 **absent**, not reported as skipped, when their build prerequisites are missing, so a passing `ctest` percentage
@@ -171,17 +172,26 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
-For the standalone `v_mullit_f32` readback, build the full-screen triangle and the
-hand-written semantic fixture, then run 120 draws with runtime SGPR inputs.
-The driver checks every pixel against an integer product rounded to 24 bits.
-It reports the input words, pixel and channel on the first mismatch.
+For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
 
-```sh
-python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
-python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
+On Windows, `run_gpu_tests.py` assembles and translates the D3D-78 fixture and runs the UAV readback and WARP
+comparison from the same build folder. Use `--filter cs_texture_uav` to run only this case:
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = "1"
+python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_texture_uav
 ```
 
-For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
+Use the actual configuration subfolder for the executables with a multi-config generator. The native Windows
+case reports SKIP without WARP or a sufficiently capable Vulkan device; failed translation, a missing test
+executable on Windows, and readback mismatches fail the runner. Devices without sliced 3D views still run the 1D,
+array and whole-mip cases and check that partial views are refused.
+
+CTest runs the same D3D-78 descriptor creation, copy, range/refusal and clear checks with `--descriptors-only`.
+That mode requires Vulkan, but not a translated shader or WARP. The GPU runner still exercises dispatch and readback.
+
+Use `--filter cs_imgload_mip` to check 2D `image_load_mip` on FLOAT (UNORM), UINT and SINT sampled views with
+both full-width and D16 loads; mip 0 contains decoy data and mip 1 holds the expected texels.
 
 `vk_compute_test`, `vk_bindless_test` and `vk_image_fuzz` read `LEONIDA_VK_VALIDATION` too (`vk_compute_test`
 through `runtime/test/vk_validation.h`): each validation message goes to stderr and a validation error makes the
@@ -227,6 +237,49 @@ Wine 11.22 on a Wayland session, through XWayland) the same 123-test list gives 
 and `vk_presenter_sync`, `xbox_present` and `dxgi_swapchain` pass, while they fail under `xvfb-run`. Use a real
 compositor for those three. Six still failed with a real display: `device_proxy`, `d3d12_xs_root_signature`,
 `xdxr_build`, `d3d12_xdxr_rt`, `d3d12_present` and `d3d12_compute`.
+
+Run one after another as above, the suite takes several seconds per test, although a test started by hand takes 0.1 to
+1 second. Four settings make a local run of the cross-build much faster:
+
+```sh
+export WINEPREFIX="$HOME/.local/share/leonida-wine" WINEDEBUG=-all \
+       WINEDLLOVERRIDES="winedbg.exe=d;winemenubuilder.exe=d"
+mkdir -p "$WINEPREFIX"
+xvfb-run -a sh -c 'wineserver -p; wine wineboot -u </dev/null >/dev/null 2>&1
+                   ctest --test-dir runtime/build/windows -j 6 --timeout 120; wineserver -k'
+```
+
+Start the server before `wineboot`: `wineserver -p` does nothing while another server runs for the prefix. Run
+`wineboot` after it, with its output thrown away: the first Wine program a server runs starts the prefix's services,
+which keep that program's output open for as long as the server lives, so a first test that started them would wait
+for the end of its output until the timeout.
+
+- `wineserver -p` keeps one Wine server for the whole run; without it a new one starts for each test.
+- `winedbg.exe=d`: a test that crashes otherwise waits in Wine's debugger until its timeout.
+- `winemenubuilder.exe=d`: without it `wineboot` on a fresh prefix writes `wine-extension-*.desktop` files and the MIME
+  cache into `~/.local/share/applications`, pointing your file associations at the test prefix. Set it before the
+  prefix is first made.
+- `ctest -j 6` runs six tests at a time. The tests that share files under the temp directory (see "Known problems")
+  can then fail now and then; rerun such a failure on its own before you count it.
+
+Measured with Wine 11.22 on llvmpipe, 40 tests of a clang-cl build (`ctest -R '^(d3d12_[a-c]|vk_[a-d]|xg)'`), adding
+one setting at a time:
+
+| Settings | Seconds |
+|---|---|
+| As above: one test after another | 179 |
+| `wineserver -p` (and `wineboot` after it) | 35 |
+| and `WINEDEBUG=-all` | 35 |
+| and `winedbg.exe=d` | 35 |
+| and `ctest -j 6` | 5.6 |
+| `ctest -j 6` and the overrides, without `wineserver -p` | 18 |
+
+The kept server is most of it: a test that takes 0.05 seconds with it took about 3.4 without, the time of a server
+starting and stopping. `WINEDEBUG=-all` and `winedbg.exe=d` changed nothing here because no test crashed; with a crash,
+`winedbg.exe=d` saves the rest of that test's timeout. The full suite (about 310 tests) took about 28 minutes run one
+after another, and 67 seconds with all four settings for two devices (llvmpipe and an integrated GPU) run at the same
+time. `scripts/run_wine_tests.py` (below) does the same: 32 seconds for those 40 tests with `--jobs 1`, 6 with
+`--jobs 6`, and 19 seconds for all 312 tests with `--jobs 6`.
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
@@ -300,7 +353,12 @@ WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG
 
 The session script initializes a dedicated prefix and stops its Wine processes at exit. On a headless host,
 put `xvfb-run -a` before `bash` so prefix initialization and the tests share one virtual display. The test runner
-maps the recorded Windows drive to the Linux checkout for shaders referenced by absolute Windows paths. It prints
+maps the recorded Windows drive to the Linux checkout for shaders referenced by absolute Windows paths. It keeps one
+wineserver alive for the run and stops it at the end, and adds `winedbg.exe=d;winemenubuilder.exe=d` to each test's
+`WINEDLLOVERRIDES` (an entry of yours for the same program wins). `--jobs N` runs N tests at a time (default 1): tests
+marked `RUN_SERIAL` run alone, tests that share a `RESOURCE_LOCK` never overlap, and the verdicts are printed in the
+same order as with `--jobs 1`; the tests that share temp files can fail now and then in parallel (see "Known
+problems"). It prints
 every verdict and returns a failure status if any required test fails, skips or is missing. Check the printed
 verdicts for failures outside the required set.
 
@@ -346,6 +404,28 @@ on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 102
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
 
+`cs_w32_salu_ext` runs 38 scalar ALU ops that no other fixture runs: `s_sub_i32`, `s_andn2_b32`, `s_orn2_b32`,
+`s_xor_b32`, `s_ashr_i32`, `s_mul_hi_u32`, `s_lshl3_add_u32`, `s_lshl4_add_u32`, `s_pack_ll_b32_b16`,
+`s_pack_hh_b32_b16`, `s_abs_i32`, `s_bcnt0_i32_b32`, `s_bitset0_b32`, `s_bitset1_b32`, `s_brev_b32`, `s_flbit_i32`,
+`s_flbit_i32_b32`, `s_sext_i32_i8`, the six `s_cmp_*_i32`, `s_cmp_gt_u32`, `s_cmp_le_u32`, `s_bitcmp0_b32`,
+`s_bitcmp1_b32`, `s_addk_i32`, `s_mulk_i32`, `s_cmovk_i32`, `s_ashr_i64`, `s_lshl_b64`, `s_lshr_b64`,
+`s_bcnt0_i32_b64`, `s_bitset0_b64`, `s_cmov_b64` and `s_ff0_i32_b64`. Its sixteen operand words arrive in `s4..s19`
+through `VKC_SGPRS`, so each op reaches the driver as SPIR-V: a scalar op on literals is folded by the translator
+(the "Chained scalar constant folding" row of [design.md](design.md)) and only its result is stored. One thread stores
+every destination and four words of SCC bits: SCC after each op that writes it, each run on operands that set it
+and on operands that clear it; each compare and bit test both ways, the signed and the unsigned ones on words that
+tell the two apart; and SCC after each op that must keep it, set to 1 and to 0 in turn before them. The 73 expected
+words are literals in `check.py`, derived in the fixture's header, and `tests/test_gpu_salu_ext.py` recomputes them
+from the fixture's own instruction lines with the reference of `tools/salu_diff.py`, the model that was compared
+with hardware. Both GPU runners compare the whole 80-word heap, the untouched fill after the results included. Run
+it alone with `python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_salu_ext --require-pass`.
+On an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 80 words match. Nine
+translator rules broken one at a time each failed it on both: `s_ashr_i32` shifting in zeros (word 8),
+`s_lshlN_add_u32` taking SCC from the add's carry alone (word 69), `s_abs_i32` negating (word 17), `s_mulk_i32` and
+`s_addk_i32` zero-extending their immediate (words 37 and 21), `s_cmovk_i32` ignoring SCC (word 38), the 64-bit
+shifts taking their count modulo 32 and `s_ashr_i64` shifting in zeros (word 51), and the 64-bit shifts taking SCC
+from the low dword alone (word 72).
+
 `cs_w32_shift64` checks `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` with 64 memory-fed cases:
 eight boundary values crossed with counts 0, 1, 31, 32, 33, 63, 64 and 65. The expected values come from Python
 integers using the low six count bits, as specified by the [RDNA2 ISA, VOP3 opcodes 767–769](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
@@ -356,6 +436,85 @@ the driver cannot replace the tested operations with constant-folded answers. Ru
 It needs shader Int64 support; a device that lacks it reports a skip. This is a wave32 test of 64-bit values,
 independent of wave64 emulation. On RTX 3080 Ti (616.92, Windows 11), all 640 words matched; replacing the count
 mask with 31 or the arithmetic shift with a logical shift made the test fail at words 66 and 251 respectively.
+
+`cs_w32_frexp_ldexp` checks `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_ldexp_f32`, `v_frexp_mant_f64` and
+`v_frexp_exp_i32_f64`, which the translator computes with integer ops on the float's words. 64 records of a binary32
+value, an `ldexp` exponent and a binary64 value are loaded at run time: normals, the clamp of the exponent at ±512
+and beyond, results that overflow to an infinity and that fall below the smallest normal, binary32 denormals (read
+as zero), binary64 subnormals (normalized; single fraction bits on both sides of the dword boundary and patterns
+with several), zeros, infinities and NaNs. Each thread stores the five results, `v_frexp_mant_f32` with a `neg`
+source and `v_ldexp_f32` with an `abs` source run with the odd threads turned off, whose destination must keep the
+word it held. The expected words come from an oracle written from the rows of [design.md](design.md)
+(`frexp_mant_f32`, `frexp_exp_i32_f32`, `ldexp_f32` and `frexp_f64` in `check.py`), and
+`tests/test_gpu_frexp_ldexp.py` checks it against `math.frexp` and `math.ldexp` wherever those agree with the
+hardware. Both GPU runners compare all 768 heap words, the 256 unchanged input words included. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_frexp_ldexp --require-pass`.
+On an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 768 words match. While
+the binary32 ops still applied `neg` and `abs` with `OpFNegate` and `FAbs`, six words differed on the 4070 Ti and none
+on llvmpipe: every NaN source under a modifier came back as `0x7fffffff`, the driver's default NaN (word 419 is the
+first: the mantissa of the negated `0x7fc00000`). Rules broken one at a time each failed the test on both devices:
+the mantissa given the exponent field 127 (word 0) or, for binary64, 1023 (word 5), the exponent subtracting 127
+(word 1), `v_ldexp_f32` without its clamp (word 258) or overflowing to the largest finite value (word 106), a
+binary32 denormal not read as zero (word 352), the binary64 subnormal exponent off by one in the low or in the high
+dword (words 134 and 150), and the fixture without its `v_cmpx` (word 15).
+
+`cs_w32_cmp_f64` checks the 32 binary64 vector compares, `v_cmp_*_f64` into VCC and `v_cmpx_*_f64` on EXEC, with
+256 memory-fed operand pairs: the product of 16 values (±inf, ±max, the 1-ULP neighbours of ±1, the smallest
+subnormals, ±0, the smallest normal, a NaN whose payload is only in the low dword and a negative quiet NaN). Each
+thread stores one bit per predicate for both forms, a bit for `tru` run with the odd threads turned off (an inactive
+lane gets VCC 0 from `v_cmp_` and stays off through `v_cmpx_`) and two bits for `lt` and `nge` with VOP3 `abs`/`neg`.
+The expected words come from Python floats (`cmp_f64_words` in `check.py`): IEEE-754 ordering, with every pair that
+has a NaN unordered. Both GPU runners compare all 1536 heap words (512 result words and 1024 unchanged input words);
+the operands are loaded at run time, so neither the translator nor the driver can fold a compare. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_cmp_f64 --require-pass`.
+It is a wave32 test and no step of it needs a particular subgroup width, so it also runs on llvmpipe; the SGPR-pair
+and constant operand forms are CPU-checked only (`tests/semantic/test_cmp_f64.py`). On an RTX 4070 Ti (NVIDIA
+620.70.06, Linux) all 1536 words matched, and seven translator rules broken one at a time each failed it: no `-0`
+canonicalization at word 206, a NaN test that ignores the low dword at word 28, an ordering key without the low
+dword at word 70, the raw result written to an inactive lane's VCC at word 2, `v_cmpx_` replacing EXEC at word 3,
+`abs` ignored and `nlt` lowered as the negation of `le` at word 0.
+
+`cs_w32_round_f64` checks `v_trunc_f64`, `v_ceil_f64`, `v_rndne_f64` and `v_floor_f64`, which the translator gives
+to the driver's double-precision `Trunc`, `Ceil`, `RoundEven` and `Floor` (`shaderFloat64`). 64 inputs are loaded at
+run time: signed zeros, the smallest subnormals and normals, values around 0.5 and 1 (the largest value below 0.5
+among them), ties from 0.5 to 5.5 and at 2^31 + 0.5, 2^51 + 0.5 and 2^52 - 0.5, integers from 2^52 to 2^63, 1e300,
+the largest finite value, the infinities, and quiet and signalling NaNs. Each thread stores the four roundings,
+`v_trunc_f64` with a `neg` source, `v_ceil_f64` with an `abs` source, a `v_floor_f64` whose destination pair overlaps
+its source pair, and a `v_rndne_f64` run with the odd threads turned off, whose destination must keep the pair it
+held. The expected words come from Python (`round_f64` in `check.py`: exact IEEE-754, the result keeping its
+source's sign), and `tests/test_gpu_round_f64.py` checks that oracle against exact rational rounding. All 1152 heap
+words are compared exactly, the 128 unchanged input words included: a NaN and a subnormal are rounded by the
+translated code with integer ops and not by the driver, as the row in [design.md](design.md) says. (llvmpipe gets
+one allowance, for what it does to `Trunc` and `RoundEven` on some CPUs; see below.) Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_round_f64 --require-pass`.
+It needs `shaderFloat64`; a device without it reports a skip.
+
+Measured: on an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 1152 words
+match. While those two kinds of input still went to the driver's function, 15 of the 512 results differed on the
+4070 Ti, those of the two signalling NaNs, which came back quiet with sign and payload kept (`0x7ff0000000000001`
+gave `0x7ff8000000000001`), and five more on llvmpipe, which read the two smallest subnormals as zero (`v_ceil_f64`
+of the positive one gave +0 instead of 1, `v_floor_f64` of the negative one -0 instead of -1). Rules broken one at a
+time each failed the test on both devices: a NaN left to the driver (word 784), the NaN and subnormal tests ignoring
+the low dword, `v_ceil_f64` or `v_floor_f64` lifting the subnormal of the wrong sign (words 34 and 38), a subnormal's
+result losing its sign (word 40), a NaN's low word dropped (word 784), `rndne` lowered as `floor(x + 0.5)` (word 20,
+the sign of -0), `trunc` or `ceil` lowered as `Floor`, the `neg` or the `abs` source modifier ignored (words 8 and
+26), the two result words swapped (word 8), and the fixture without its `v_cmpx` (word 30). Two changes are not
+caught everywhere: a subnormal left to the driver fails on llvmpipe (word 34) and passes on the 4070 Ti, which keeps
+binary64 denormals, and `RoundEven` replaced by GLSL `Round` changes nothing on either device, since both send a tie
+to the even integer.
+
+llvmpipe gave those results on a CPU with AVX-512. On one without it, `Trunc` and `RoundEven` of a double go through
+the code llvmpipe has for a float, because its double vectors are twice its native width (512 bits at the usual 256)
+and it only has the exact rounding for a width the CPU has an extension for. There a magnitude above 2^24 comes back
+unchanged (`v_trunc_f64` of 123456789.0625 is 123456789.0625) and `RoundEven` of a smaller one can give the other
+neighbouring integer (1 for 1.5, 0 for the value just above 0.5): 48 of the 512 results, the same 48 with Mesa
+25.2.8 (LLVM 20.1.2) on a CI runner and with Mesa 26.2.6 under `GALLIUM_OVERRIDE_CPU_CAPS=avx`, which is how to see
+it on a CPU that has AVX-512. `Floor` and `Ceil` are exact on that path. The CI's runners differ in this, so the
+unchanged fixture passed or failed there by the machine it got. On llvmpipe the judge therefore lets `v_trunc_f64`
+and `v_rndne_f64` return what that path can give, the source itself above 2^24 and either neighbouring integer
+from 0.5 up to it, and nothing else (`ROUND_F64_FLOAT_PATH` in `check.py`); `v_floor_f64`, `v_ceil_f64`, the kept
+pair and the inputs stay exact there, and no other device gets the allowance. `LP_NATIVE_VECTOR_WIDTH=128` makes
+llvmpipe exact on a CPU with AVX.
 
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
@@ -396,23 +555,6 @@ Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixt
 3. Add it to `EXPECT` in `tests/test_wave64_halves_fixtures.py` with the tier, reasons and idioms the translator
    should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
 4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
-## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
-
-The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
-`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
-`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
-AMD's older Windows drivers report 128 on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5
-7600's iGPU on 24.10.24); 26.11.2 reports 256 on a Radeon 610M, where these tests run without the variable below.
-RADV reports more on the same chips.
-
-To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
-`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
-and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
-block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
-`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
-only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
-(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
-constants, so those tests skip.
 
 ## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
 
@@ -520,8 +662,12 @@ also advertises the feature but returns a wrong third `BaryCoordKHR` component, 
 expected (#5933: Vega 8, PCI 1002:15E7, driver 31.0.21921.13001). `ps_bary`, `ps_persp_bary` and `ps_ij_computed`
 fail natively; through the fallback `ps_bary` and `ps_persp_bary` pass. `tools/vk_subgroup_info.py` reports
 `barycentric_fallback` for these PCI IDs under `VK_DRIVER_ID_AMD_PROPRIETARY`, so `make_game.py` and
-`run_gpu_tests.py` turn the fallback on by themselves there, with the same `LEONIDA_BARY_FALLBACK` override. RADV and
-other GCN 5 GPUs are not covered: none has been measured.
+`run_gpu_tests.py` turn the fallback on by themselves there, with the same `LEONIDA_BARY_FALLBACK` override. RADV
+(Mesa 26.2.6) on the same Vega 8 doesn't list `VK_KHR_fragment_shader_barycentric` at all, though it sets the
+`fragmentShaderBarycentric` feature, so the four raw-barycentric tests skip there and pass with
+`LEONIDA_BARY_FALLBACK=1`, and `ps_interp_f16_high` passes through the f16 fallback that `run_gpu_tests.py` turns on
+by itself ([#166 entry](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7109387712)). Other GCN 5 GPUs
+are not covered: none has been measured.
 
 ## Macs: 16-bit interpolation without PerVertexKHR
 
@@ -644,6 +790,7 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | `d3d12_descriptor_test` reports that the set had room for fewer than 5001 2D views and 2100 samplers, and the device logs that the bindless set holds fewer samplers than a full shader-visible sampler heap | The device's descriptor limits, or its `vkGetDescriptorSetLayoutSupport`, allow no bigger bindless set ([d3d12_vulkan.md](d3d12_vulkan.md) section 5). MoltenVK's answer is ignored, since it rejects every layout of `maxPerSetDescriptors` (1212) or more although it runs the full set | Expected where the limits are low. The test still checks the last index of each array and that the next view and sampler are refused |
 | `cs_dpp_ops` fails on a Mac with MoltenVK 1.4.2: `out[0..7] = 100 100 11 ...`, want `100 10 11 ...` | MoltenVK 1.4.2's SPIRV-Cross moves the DPP lowering's subgroup ballot and shuffle into a short-circuiting `&&` and `?:`, so only some lanes run them and lane 1 sees its source lane 0 as inactive. SPIRV-Cross `5c372ffb` (in MoltenVK `main`) keeps them out of `?:`; a ballot on the right of `&&` is still moved there in SPIRV-Cross `57e4efcc` | Fixed in the translator (SHADER-529, #3227): it stores the ballot and the shuffle to variables of their own, so the MSL that MoltenVK 1.4.2 generates (`MVK_CONFIG_DEBUG=1`) runs each as a statement in every lane. Translate again with current `main`; MoltenVK `main` and KosmicKrisp are no longer needed for it. A pass alone does not show the fix: an Apple M5 Pro (macOS 26.5.1) returns the right words with 1.4.2 even when the ballot is on the right of `&&` |
 | `check.py`'s `cs_fma_fused` fails on a Mac with MoltenVK 1.4.2: word 7 reads `15360` (`0x3c00`), want `29521` (`0x7351`) | The f16 multiply-add (round to odd). The MSL of 1.4.2 and of MoltenVK `main` differ only in SPIRV-Cross's precise-arithmetic helpers (`[[clang::optnone]]` and `fma(l, r, 0)` against `math_mode(safe)` and `fma(l, r, -0.0)`, the SHADER-182 / SHADER-234 change) | Expected with MoltenVK 1.4.2; it passes with MoltenVK `main` |
+| `ps_imgatomic` fails in about two of three runs on a Mac with MoltenVK 1.4.2: 1 to 6 of the 256 image-atomic texels are wrong while the render target is exact, for example `2D umax texel 48: got 0x00000d45, want 0x00000dc7` | MoltenVK 1.4.2 lowers the four `OpAtomic*` on image texels to Metal's texture atomics (`atomic_fetch_max`, `atomic_fetch_min` and `atomic_fetch_or` on `access::read_write` textures), and the texels read back the way a read-modify-write that is not atomic between two groups of fragment threads leaves them. A wrong `umax` texel always holds the id of one of its own 64 pixels, the largest of only some of them: on an Apple M5 it was the last pixel of the texel's first four rows in 43 of 90 cases, with all 32 larger ids gone. A wrong `umin` texel mirrors that (the first pixel of its last four rows in 39 of 48). The `or` image did not differ in 150 runs there. It is not the translator's first-lane broadcast of the descriptor index (54 of 60 runs fail with the index used directly) and not the readback (42 of 60 fail with the copies in a submission of their own after the draw). Measured on an Apple M5 (macOS 27.2.1, 101 of 150 runs fail) and an M5 Pro (#543) | Expected with MoltenVK 1.4.2. KosmicKrisp passed the same module and binary 10 times of 10 on the M5 Pro (#543). The macOS CI job does not reach it: on the runner's paravirtual device the test skips because its bindless set does not fit the descriptor limits. Do not weaken the test's expected texels |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | With `LEONIDA_W64_EMULATE=1` on llvmpipe, the `ms_*` tests fail. Measured with Mesa 26.3.1: on x86_64 at 256-bit vectors (the default there) all six abort with "LLVM ERROR: Cannot emit physreg copy instruction"; on arm64 (128-bit) `ms_tri` draws nothing (the frame stays at the clear color); on x86_64 at 128 bits (`LP_NATIVE_VECTOR_WIDTH=128`) `ms_tri` happened to draw correctly, but with Mesa 26.0.3 `ms_wave_info_s3` and `ms_v5_workgroup` draw nothing there (4 of 6 pass, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759)) ([measured runs](https://github.com/ItsNotRexed/Leonida/issues/3127#issuecomment-7086469679)) | An llvmpipe bug: a mesh shader's runtime `CullPrimitiveEXT` is stored through an invalid `bitcast <N x i1> to <N x float>` (TEST-782, #3127; see "Without a GPU: Mesa llvmpipe") | Run the mesh tests on llvmpipe without `LEONIDA_W64_EMULATE`, or add `LEONIDA_MESH_COMPUTE=1` (the compute fallback): with it all 6 `ms_*` pass emulated on llvmpipe (x86_64, 256-bit) |
 | On a Mac, `valu_fuzz.py --family f16` reads `+0` where the model wants `-0`, from a multiply whose exact product is -0 (`v_mul_f16`, `v_pk_mul_f16`) or from an FMA whose product and addend are both -0 (`v_fma_f16`, `v_fmac_f16`, `v_pk_fma_f16`) | MoltenVK computes a `NoContraction` multiply as `fma(l, r, +0)`, which drops the sign. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-182, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions. To run the rest of the fuzzer clean, add `--skip-op` for each of the five ops. To see them match, install Homebrew's `mesa` and use its KosmicKrisp driver: `LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json python3 -I tools/valu_fuzz.py --family f16 --build runtime/build/linux`. Or build MoltenVK with SPIRV-Cross `300681bb` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision`, and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
@@ -656,7 +803,7 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | A Windows CI artifact run under Wine by hand: `d3d12_compute` and the other tests that read `LEONIDA_TEST_*_SPV` end with exit 3 and no message | The `.spv` paths are compiled in as `D:/a/Leonida/Leonida/runtime/build/generated/...`; the prefix has no `D:` drive and the test isn't run from the artifact folder | Run it from the artifact folder (the tests then find `generated/<name>.spv` there) or through `scripts/run_wine_tests.py`, which maps that drive for the run; current `main` names the file it couldn't copy (`cannot copy ...: File not found`) |
 | Linux cross-build: CMake can't find `clang-cl-19` (or another versioned `clang-cl-<N>`) although `clang-19` and `lld-19` are installed | On Debian and Ubuntu, the versioned `clang-cl-<N>` link is in the `clang-tools-<N>` package, not in `clang-<N>` (`/usr/lib/llvm-<N>/bin/clang-cl` comes from it too); `lld-link-<N>`, `llvm-lib`, `llvm-rc` and `llvm-mt` come from `lld-<N>` and `llvm-<N>` | `sudo apt-get install clang-tools-19 lld-19 llvm-19` (Ubuntu 24.04 has 19 and 20), then pass the versioned names as in [the cross-build](#the-windows-runtime-on-linux-under-wine-or-proton) |
 | Under Ubuntu's Wine 9.0, `wineboot --init` (and every Wine program after it) stops at once with `free(): invalid pointer` or a segmentation fault, before printing anything else; the prefix holds only a `wineserver` file | That Wine opens `/run/user/<uid>` for its server directory, whether `XDG_RUNTIME_DIR` is set or not, and aborts when the folder doesn't exist. The login manager makes it for a desktop session; a container or a shell started without a login session (a root shell in Docker, a CI runner image) has none | Create it before starting Wine: `mkdir -p /run/user/$(id -u) && chmod 700 /run/user/$(id -u)` (setting `XDG_RUNTIME_DIR` alone doesn't help), delete the half-made prefix, and run `wineboot --init` again |
-| `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
+| `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.12+ |
 | `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in the runtime and every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
 | A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |
 | `cs_sample_lz_int_d16`, `ps_sample_implicit_sint`, `ps_ssharp`, `ps_tex`, `ps_texture_mip0`, `ps_texture_sample` and `ps_texture_sample_d16` crash (exit -11 or 139) on an Intel GPU on Linux, while NVIDIA and llvmpipe pass them (TEST-399) | A bug in Mesa ANV's shader compiler: compiling these texture-sampling shaders, `nir_opt_gcm` (`nir_opt_gcm.c:430`, `gcm_schedule_early_src`) dereferences a phi source an earlier pass has freed. The SPIR-V passes `spirv-val`. Seen with Mesa 26.1.6 (Arrow Lake) and 26.2.7 (Iris Xe, ADL GT2); Mesa 26.3.1 and `main` (bb98606) pass the whole suite on the same Iris Xe | Use Mesa 26.3.1 or newer. To check a newer Mesa without installing it, build its Intel Vulkan driver and point `VK_DRIVER_FILES` at its `src/intel/vulkan/intel_devenv_icd.x86_64.json` |

@@ -435,6 +435,9 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             elif op == "OpStore":
                 p = base_ptr(inv, args[0])
                 write_ptr(inv, p, val_of(inv, args[1]))
+            elif op == "OpAtomicStore":   # pointer, scope, semantics, value: a store with no result
+                p = base_ptr(inv, args[0])
+                write_ptr(inv, p, val_of(inv, args[3]))
             elif op == "OpConvertUToPtr":
                 inv.ssa[res] = ("phys", val_of(inv, args[1]))
             elif op == "OpUConvert":
@@ -1056,7 +1059,8 @@ class DivergentLoopBallotTests(unittest.TestCase):
         configs = [
             ("native_64", 64, 64, False, True),
             ("native_128", 128, 64, False, True),
-            # a reducible multi-block loop takes the structured emulation since #2089 (no round OpSwitch) ...
+            # a reducible multi-block loop takes the structured emulation since #2089 (no round OpSwitch); a
+            # single wave keeps its exchange barriers under `%pc`-only guards (inline_all, no round fallback) ...
             ("emulate_64_sg32", 64, 32, True, True),
             ("emulate_128_sg32", 128, 32, True, True),
             ("emulate_40_partial_sg32", 40, 32, True, True),
@@ -1072,6 +1076,12 @@ class DivergentLoopBallotTests(unittest.TestCase):
                 if emulate:
                     self.assertEqual(gen.control_flow,
                                      "emulated wave64 structured" if structured else "emulated wave64 rounds")
+                    if structured and threads <= 64:
+                        self.assertEqual(gen.emulate_plan["mode"], "inline_all")
+                        self.assertNotIn("OpSwitch", spv)
+                    else:
+                        # multi-wave (and the round scheduler): every barrier in uniform control flow
+                        self.assertFalse(rdna2spirv.barriers_under_control_flow(spv))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):

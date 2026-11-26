@@ -20,9 +20,14 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/bcpack.py"
+      - "tools/bcpack_history_train.cpp"
+      - "tools/bcpack_tables.py"
+      - "tools/bcpack_tables_bptc.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
+      - "tools/conformance/**"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
       - "tools/file_mode.py"
@@ -30,23 +35,28 @@ on:
       - "tools/fspx_unpack.py"
       - "tools/fssm_header.py"
       - "tools/fssm_unpack.py"
+      - "tools/gen_bcpack_runtime_tables.py"
       - "tools/gen_d3d12_stubs.py"
       - "tools/gfx10_formats.json"
       - "tools/lane_masks.py"
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
+      - "tools/native_pso_hashes.py"
       - "tools/rdna2_decode.py"
       - "tools/rdna2_isa_tables.py"
       - "tools/rdna2spirv.py"
       - "tools/replace_retry.py"
       - "tools/report_paths.py"
       - "tools/shader_carve.py"
+      - "tools/shader_carve_accel.py"
+      - "tools/shader_carve_native/**"
       - "tools/shader_disasm.py"
       - "tools/shader_ir.py"
       - "tools/shader_meta.py"
       - "tools/shader_stage_manifest.py"
       - "tools/spirv_asm.py"
       - "tools/spirv_asm_tables.py"
+      - "tools/spirv_loop_guard.py"
       - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
       - "tools/vk_subgroup_info.py"
@@ -62,9 +72,14 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/bcpack.py"
+      - "tools/bcpack_history_train.cpp"
+      - "tools/bcpack_tables.py"
+      - "tools/bcpack_tables_bptc.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
+      - "tools/conformance/**"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
       - "tools/file_mode.py"
@@ -72,23 +87,28 @@ on:
       - "tools/fspx_unpack.py"
       - "tools/fssm_header.py"
       - "tools/fssm_unpack.py"
+      - "tools/gen_bcpack_runtime_tables.py"
       - "tools/gen_d3d12_stubs.py"
       - "tools/gfx10_formats.json"
       - "tools/lane_masks.py"
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
+      - "tools/native_pso_hashes.py"
       - "tools/rdna2_decode.py"
       - "tools/rdna2_isa_tables.py"
       - "tools/rdna2spirv.py"
       - "tools/replace_retry.py"
       - "tools/report_paths.py"
       - "tools/shader_carve.py"
+      - "tools/shader_carve_accel.py"
+      - "tools/shader_carve_native/**"
       - "tools/shader_disasm.py"
       - "tools/shader_ir.py"
       - "tools/shader_meta.py"
       - "tools/shader_stage_manifest.py"
       - "tools/spirv_asm.py"
       - "tools/spirv_asm_tables.py"
+      - "tools/spirv_loop_guard.py"
       - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
       - "tools/vk_subgroup_info.py"
@@ -96,25 +116,33 @@ on:
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
+  # Daily default-branch snapshot, staggered after CI; ordinary pushes keep coalescing.
+  schedule:
+    - cron: "53 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   # Coalesce superseded pending pushes per branch without canceling an active main build.
+  # Scheduled/manual runs already use run_id and cannot be replaced by queued pushes.
   group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # A build with a cold sccache took 18.3 min (main, 24 Nov), which left a 20-minute job under 2 min for the
+    # whole ctest run. The ctest step bounds each test on its own, so a hung test no longer needs this to stop it.
+    timeout-minutes: 35
     outputs:
       wine-artifact: ${{ steps.upload-wine-artifact.outcome }}
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -249,6 +277,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
           -DLEONIDA_REQUIRE_VULKAN=ON
+          -DLEONIDA_REQUIRE_XMA2_DECODER=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
@@ -294,8 +323,10 @@ jobs:
             runtime/build/windows-root.txt
           retention-days: 7
           if-no-files-found: error
+      # --timeout: a test without a TIMEOUT of its own fails after 5 min instead of the CTest default of 25, which
+      # is longer than the job. The slowest on Linux and macOS (xdxr_build_check) takes 50 and 106 s.
       - name: CPU runtime tests
-        run: ctest --test-dir runtime/build --output-on-failure
+        run: ctest --test-dir runtime/build --output-on-failure --timeout 300
 
   # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
@@ -318,6 +349,8 @@ jobs:
     name: wine (${{ matrix.wine }})
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: runtime-windows
@@ -379,6 +412,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Cache Vulkan headers
         id: vulkan-headers-cache

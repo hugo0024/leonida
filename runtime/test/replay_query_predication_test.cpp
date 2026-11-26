@@ -7,7 +7,8 @@
 // inside ordinary, the composite sum-and-normalize binary resolve, helper dispatches inside overlapping statistics
 // queries, the single-list refusal (D3D-252) and, with a pool, its replay (D3D-399). Cases 15 and 16 check queries
 // that hold mesh draws, split between the full and the mesh-compatible pool, alone and overlapping (D3D-291). No GPU or
-// game data.
+// game data. Case 18 checks SO_STATISTICS: overlapping queries on one stream are refused
+// (VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753) and streams past maxTransformFeedbackStreams resolve zero (D3D-302).
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -127,8 +128,8 @@ int main() {
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
         return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, const std::uint8_t*, std::uint32_t first,
-                           std::uint32_t count, VkBuffer, VkDeviceSize) {
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, VkQueryPool, const std::uint8_t*,
+                           std::uint32_t first, std::uint32_t count, VkBuffer, VkDeviceSize) {
         g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
     };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
@@ -685,14 +686,18 @@ int main() {
         auto segments = std::make_shared<OcclusionSegmentPool>();
         segments->pool = handle<VkQueryPool>(9);
         segments->mesh_pool = handle<VkQueryPool>(10);
+        segments->primitives_pool = handle<VkQueryPool>(11);
         segments->mesh = prepared.statistics_mesh;
         segments->destroy = mock_destroy_pool;
         QueryReplay queries;
         expect(queries.plan(prepared, {}, 0, true, segments, 0) == ReplayResult::success, "plan mixed list");
         expect(prepared.statistics_mesh_pool == handle<VkQueryPool>(10), "mixed list: the mesh pool is the list's");
+        expect(prepared.statistics_primitives_pool == handle<VkQueryPool>(11),
+               "mixed list: the mesh-primitives pool is the list's");
         expect(q[6].resolves.size() == 1 && q[6].resolves[0].sum && q[6].resolves[0].first == 3 &&
                    q[6].resolves[0].count == 1 && q[6].resolves[0].mesh_pool == handle<VkQueryPool>(10) &&
-                   q[6].resolves[0].mesh && q[6].resolves[0].mesh[3] == 1,
+                   q[6].resolves[0].primitives_pool == handle<VkQueryPool>(11) && q[6].resolves[0].mesh &&
+                   q[6].resolves[0].mesh[3] == 1,
                "mixed list: the mesh-only query's resolve sums its one mesh segment");
         expect(queries.needs_statistics_sum, "mixed list: the statistics sum helper is needed");
 
@@ -753,6 +758,120 @@ int main() {
         // queries[] follows the commands: Begin 0, Begin 1, End 0, End 1.
         expect(q[2].statistics_first == 0 && q[2].statistics_count == 2, "overlap-mesh: query 0 sums segments 0-1");
         expect(q[3].statistics_first == 1 && q[3].statistics_count == 3, "overlap-mesh: query 1 sums segments 1-3");
+    }
+
+    // 17. D3D-291: the pool a mesh draw runs in must not enable a counter
+    //     VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 forbids, or the validation layer reports the VUID on
+    //     every DispatchMesh inside a statistics query. The VUID leaves the fragment and compute invocations
+    //     allowed, and those are the two the mesh pool counts; the nine it names are the rest of the eleven.
+    {
+        constexpr VkQueryPipelineStatisticFlags all_counters = 0x7ff;  // the counters of a D3D12 statistics heap
+        expect((kMeshStatisticsFlags & kForbiddenMeshStatisticsFlags) == 0,
+               "the mesh pool enables none of the counters the VUID forbids");
+        expect((all_counters & ~kForbiddenMeshStatisticsFlags) == kMeshStatisticsFlags,
+               "the mesh pool counts every counter the VUID leaves allowed");
+        expect(kMeshStatisticsFlags == (VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
+                                        VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT),
+               "the mesh pool counts the fragment and compute invocations");
+    }
+
+    // 18. D3D-302: two overlapping SO_STATISTICS queries on one stream would be two active indexed queries in one
+    //     pool (VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753). prepare() refuses them; different streams are fine.
+    //     A stream past the pool's maxTransformFeedbackStreams runs nothing and resolves zero.
+    {
+        QueryPool so{handle<VkQueryPool>(8), d3d12_query_heap::so_statistics, 4, false,
+                     std::vector<bool>(4, false), {}, 4};
+        ReplayFunctions indexed = vk;
+        indexed.query_pool = [&](QueryHeapId id) -> QueryPool* { return id == 8 ? &so : nullptr; };
+        indexed.begin_query_indexed = +[](VkCommandBuffer, VkQueryPool pool, std::uint32_t index,
+                                          std::uint32_t stream, VkQueryControlFlags) {
+            g_trace->events.push_back(query_event("begin_indexed", pool, index) + "/" + std::to_string(stream));
+        };
+        indexed.end_query_indexed = +[](VkCommandBuffer, VkQueryPool pool, std::uint32_t index,
+                                        std::uint32_t stream) {
+            g_trace->events.push_back(query_event("end_indexed", pool, index) + "/" + std::to_string(stream));
+        };
+
+        {
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0");
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 1}), "record second SO begin stream 0");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 1}), "record second SO end stream 0");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0");
+            expect(list.close(), "close overlapping SO stream list");
+            PreparedList prepared;
+            expect(prepare(list, resolve, indexed, prepared) == ReplayResult::invalid_query,
+                   "two overlapping SO_STATISTICS queries on one stream are refused");
+        }
+        {
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0");
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0 + 1, 1}), "record SO begin stream 1");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0 + 1, 1}), "record SO end stream 1");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0");
+            expect(list.close(), "close two-stream SO list");
+            PreparedList prepared;
+            expect(prepare(list, resolve, indexed, prepared) == ReplayResult::success,
+                   "overlapping SO_STATISTICS queries on different streams are fine");
+        }
+        // The VUID holds per command buffer, not per pool: one stream in two heaps is refused too, while queries that
+        // take turns on that stream are fine.
+        QueryPool so2{handle<VkQueryPool>(9), d3d12_query_heap::so_statistics, 4, false,
+                      std::vector<bool>(4, false), {}, 4};
+        ReplayFunctions two_heaps = indexed;
+        two_heaps.query_pool = [&](QueryHeapId id) -> QueryPool* {
+            return id == 8 ? &so : id == 9 ? &so2 : nullptr;
+        };
+        {
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 8");
+            expect(list.begin_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 9");
+            expect(list.end_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 9");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 8");
+            expect(list.close(), "close two-heap SO stream list");
+            PreparedList prepared;
+            expect(prepare(list, resolve, two_heaps, prepared) == ReplayResult::invalid_query,
+                   "overlapping SO_STATISTICS queries on one stream in two heaps are refused");
+        }
+        {
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 8");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 8");
+            expect(list.begin_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 9");
+            expect(list.end_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 9");
+            expect(list.close(), "close two-heap SO stream list in turn");
+            PreparedList prepared;
+            expect(prepare(list, resolve, two_heaps, prepared) == ReplayResult::success,
+                   "SO_STATISTICS queries on one stream in two heaps, one after the other, are fine");
+        }
+        // A one-stream pool: stream 0 runs, stream 1 is zero-filled and emits nothing.
+        so.streams = 1;
+        {
+            Trace trace;
+            g_trace = &trace;
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0 + 1, 0}), "record unsupported SO begin");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0 + 1, 0}), "record unsupported SO end");
+            expect(list.resolve_queries({8, d3d12_query::so_statistics_stream0 + 1, 0, 1, 1, 0}),
+                   "record unsupported SO resolve");
+            expect(list.close(), "close unsupported stream list");
+            expect(replay(list, VK_NULL_HANDLE, resolve, indexed) == ReplayResult::success,
+                   "a stream past maxTransformFeedbackStreams replays");
+            expect(trace.fills == 1 && trace.events == std::vector<std::string>{"fill"},
+                   "a stream past maxTransformFeedbackStreams emits no query and resolves zero");
+        }
+        {
+            Trace trace;
+            g_trace = &trace;
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record supported SO begin");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record supported SO end");
+            expect(list.close(), "close supported stream list");
+            expect(replay(list, VK_NULL_HANDLE, resolve, indexed) == ReplayResult::success,
+                   "stream 0 on a one-stream pool replays");
+            expect(trace.events == std::vector<std::string>{"begin_indexed 8:0/0", "end_indexed 8:0/0"},
+                   "stream 0 on a one-stream pool begins and ends indexed on stream 0");
+        }
     }
 
     if (failures) return 1;

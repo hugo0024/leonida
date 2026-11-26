@@ -29,8 +29,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from report_paths import same_report_path  # noqa: E402
 from spirv_asm_tables import (  # noqa: E402
-    BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF, VALUE_ENUMS,
+    BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF,
+    NONSEMANTIC_SHADER_DEBUGINFO_100, VALUE_ENUMS,
 )
 
 SPIRV_MAGIC = 0x07230203
@@ -54,6 +56,7 @@ TARGET_ENV_VERSION = {
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
 _ID_RE = re.compile(r"%[A-Za-z0-9_]+")
 _EXT_SETS = {
+    "NonSemantic.Shader.DebugInfo.100": NONSEMANTIC_SHADER_DEBUGINFO_100,
     "GLSL.std.450": GLSL_STD_450,
     "NonSemantic.DebugPrintf": NONSEMANTIC_DEBUGPRINTF,    # spirv-dis writes its instruction by name
 }
@@ -638,7 +641,7 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
 
         cur_ext_table = None
         switch_type = None                 # (width, signed) of the OpSwitch selector's integer type
-        if opname == "OpExtInst" and arg_idx < len(toks):
+        if opname in ("OpExtInst", "OpExtInstWithForwardRefsKHR") and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)
@@ -687,6 +690,8 @@ def main(argv=None) -> int:
     ap.add_argument("--target-env", default="vulkan1.2", choices=sorted(TARGET_ENV_VERSION),
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
+    if same_report_path(args.src, args.out):
+        ap.error("output must not overwrite the source")
     try:
         with open(args.src, encoding="utf-8", newline="") as f:
             text = f.read()

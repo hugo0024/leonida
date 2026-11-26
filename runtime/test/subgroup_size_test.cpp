@@ -7,8 +7,10 @@
 //   - an old RADV: sizes 32..64, COMPUTE only.
 // No game data.
 #include "../src/subgroup_size.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 #define CHECK(condition) do {                                    \
@@ -138,6 +140,31 @@ int main() {
         CHECK(emulated.outcome == SubgroupOutcome::emulated && emulated.size == 0);
     }
 
+    // Read the translator's graphics tier through the same index lookup used at pipeline creation: tiers A and B are
+    // partition invariant (the device's 32-wide size is exact for them), C, an unknown tier and a non-string are not.
+    {
+        const testfiles::ScratchDir scratch("leonida_subgroup_graphics");
+        std::ofstream(scratch.path() / "index.json") << R"({
+            "a": {"stage":"vs","wave64":true,"subgroup_size":64,"fssm_sha256":"a","wave64_graphics":"A"},
+            "b": {"stage":"ps","wave64":true,"subgroup_size":64,"fssm_sha256":"b","wave64_graphics":"B"},
+            "c": {"stage":"gs","wave64":true,"subgroup_size":64,"fssm_sha256":"c","wave64_graphics":"C"},
+            "unknown": {"stage":"ps","wave64":true,"fssm_sha256":"unknown","wave64_graphics":"D"},
+            "bad": {"stage":"ps","wave64":true,"fssm_sha256":"bad","wave64_graphics":1}
+        })";
+        ShaderLibrary library;
+        CHECK(library.load(scratch.path()));
+        const auto* a = library.find("vs", "a");
+        const auto* b = library.find("ps", "b");
+        CHECK(a && b && graphics_partition_invariant(*a) && graphics_partition_invariant(*b));
+        for (const auto* shader : {library.find("gs", "c"), library.find("ps", "unknown"), library.find("ps", "bad")})
+            CHECK(shader && !graphics_partition_invariant(*shader));
+        // The size decision itself does not change: 64 cannot be had on NVIDIA, and AMD still gets it natively.
+        const auto fixed = decide_subgroup_size(*b, nvidia());
+        CHECK(fixed.outcome == SubgroupOutcome::unavailable && fixed.wanted == 64 && fixed.size == 0 && fixed.flags == 0);
+        const auto native = decide_subgroup_size(*b, amd());
+        CHECK(native.outcome == SubgroupOutcome::required && native.size == 64);
+    }
+
     // --- An old RADV: COMPUTE only ----------------------------------------------------------------------------------
     {
         const SubgroupSizeCaps caps = old_radv();
@@ -259,6 +286,32 @@ int main() {
         CHECK(caps.default_size == 64 && caps.min_size == 32 && caps.max_size == 64 &&
               caps.max_compute_workgroup_subgroups == 16 && caps.required_stages == amd_stages);
         CHECK(caps.subgroup_size_control && !caps.compute_full_subgroups);
+    }
+
+    // --- Partition-invariant wave64 graphics ----------------------------------------------------------------
+    {
+        // The translator's tier (index.json `wave64_graphics`, docs/design.md "Wave64 graphics"): A and B are exact
+        // when the wave is cut into two 32-lane halves, C is not. An entry without the analysis stays conservative.
+        ShaderEntry e = entry("ps", true);
+        CHECK(!graphics_partition_invariant(e));
+        e.wave64_graphics = "A";
+        CHECK(graphics_partition_invariant(e));
+        e.wave64_graphics = "B";
+        CHECK(graphics_partition_invariant(e));
+        e.wave64_graphics = "C";
+        CHECK(!graphics_partition_invariant(e));
+        // Only a wave64 VS/PS/GS carries the analysis; compute, mesh and wave32 entries do not.
+        e = entry("vs", true);
+        e.wave64_graphics = "A";
+        CHECK(graphics_partition_invariant(e));
+        for (const char* stage : {"cs", "ms"}) {
+            e = entry(stage, true);
+            e.wave64_graphics = "A";
+            CHECK(!graphics_partition_invariant(e));
+        }
+        e = entry("ps", false);
+        e.wave64_graphics = "A";
+        CHECK(!graphics_partition_invariant(e));
     }
 
     std::printf("subgroup size decision: AMD-like, NVIDIA-like, old RADV, limits, create-info chain and query OK\n");

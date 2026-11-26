@@ -25,18 +25,22 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
-                   fmt_xy_xyz_test, tbuffer_store_test)
-from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
+from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test,
+                   fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, compute_unsupported)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
+from check import IMAGE_STORE_CASES, texture_uav_test
+from check import salu_ext_test   # 38 scalar ALU ops on operands seeded through VKC_SGPRS
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
+from check import cmp_f64_test   # the 32 binary64 vector compares on memory-fed operands
+from check import round_f64_test   # the four binary64 roundings on memory-fed inputs
+from check import frexp_ldexp_test   # binary32 and binary64 frexp, and v_ldexp_f32, on memory-fed records
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -94,10 +98,23 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
     return struct.pack("<I", len(r)) + bytes(r)
 
 
+# A comment line a .asm carries when llvm-mc cannot assemble it (cs_dpp_cmp.asm: a VOPC compare in DPP form).
+TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
         raw = source.read()
+    if any(ln.strip() == TEXT_ONLY_MARK for ln in raw.splitlines()):
+        # The source holds an instruction llvm-mc has no gfx1013 encoding for. The translator reads straight-line
+        # code from its text alone (tests/semantic/regen_fixtures.py writes such listings), so the lines go through
+        # as they are.
+        lines = [f"; {name}  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"]
+        lines += ["\t" + ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
+        with open(s_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        return
     cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
@@ -264,6 +281,8 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
+# cs_div_fmas_f64_rt's operands a = 1 + 2^-30, c = -(1 + 2^-29) as s4..s7 (low word first).
+DIV_FMAS_F64_SGPRS = "0x00400000,0x3ff00000,0x00800000,0xbff00000"
 UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
 
 
@@ -429,8 +448,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    if rc != 0:
+        return False, f"exit {rc}: {msg or 'no test output'}"
     words = dump_words(msg)
-    if rc != 0 or words is None:
+    if words is None:
         return False, msg
     vals = words[:len(want)]
     return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
@@ -657,7 +678,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # Fixtures run by another harness, which needs what these tools do not have (a D3D12 device, the layer's root
 # arguments and code base). They are still assembled and translated here, so a translator regression shows, but no
 # checker runs them: the test program that owns them judges them.
-OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_translated_draw_test",
+OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "ps_m15_dual": "d3d12_translated_draw_test",
+                 "vs_m15": "d3d12_translated_draw_test",
                  "ps_m2": "d3d12_m2_textured_test", "vs_m2": "d3d12_m2_textured_test", "ps_m2_uoff": "d3d12_m2_textured_test",
                  "ps_m2_literal": "d3d12_m2_textured_test", "ps_m2_array": "d3d12_m2_formats_test",
                  "ps_m3": "d3d12_m3_frame_test", "vs_m3": "d3d12_m3_frame_test",
@@ -665,7 +687,8 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
                  "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test",
                  "ps_live_width": "w64_graphics.py",
-                 "ps_heap_index": "d3d12_heap_index_test"}
+                 "ps_heap_index": "d3d12_heap_index_test",
+                 "ps_quad_flat": "d3d12_quad_index_test", "vs_quad_inst": "d3d12_quad_index_test"}
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
@@ -981,10 +1004,22 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_w32_frexp_ldexp":
+            detail = frexp_ldexp_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "768 words exact (64 records, eight results each, and unchanged inputs)"))
         elif name == "cs_w32_shift64":
             detail = shift64_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,
                             detail or "640 words exact (64 shift cases and unchanged inputs)"))
+        elif name == "cs_w32_cmp_f64":
+            detail = cmp_f64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "1536 words exact (256 operand pairs and unchanged inputs)"))
+        elif name == "cs_w32_round_f64":
+            detail = round_f64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "1152 words exact (64 inputs, eight roundings each, and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
@@ -1066,6 +1101,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name == "cs_fmt_d16_xyz":
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
@@ -1094,6 +1130,10 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
             results.append((name,) + compute_result(rc, msg, rc == 0 and vals == USER_SGPRS_WORDS,
                                                     " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_w32_salu_ext":
+            detail = salu_ext_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "80 words exact (73 results of 38 scalar ops and the untouched fill)"))
         elif name == "cs_f64_add":
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
             if rc == 77:   # Float64, or Int64 where the module declares both: quote whichever it names
@@ -1102,10 +1142,12 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
-        elif name == "cs_div_fmas_f64":
+        elif name in ("cs_div_fmas_f64", "cs_div_fmas_f64_rt"):
             # One-rounding binary64 FMA: strict where the translator emitted OpFmaKHR on doubles (shaderFmaFloat64,
             # --fma khr); under the default GLSL Fma the split result (0) is allowed, as cs_fma_fused allows it.
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            # The _rt fixture reads the same operands from s4..s7, so the driver cannot fold the Fma at compile time.
+            env = dict(cs_env or os.environ, VKC_SGPRS=DIV_FMAS_F64_SGPRS) if name.endswith("_rt") else cs_env
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=env)
             if rc == UNSUPPORTED:      # no shaderFloat64, or (--fma khr) no shaderFmaFloat64
                 results.append((name, None, unsupported_skip(msg)))
             else:
@@ -1115,7 +1157,8 @@ def run_suite(a, work: str) -> int:
                 ok = rc == 0 and (words == fused or (not strict and words == split))
                 detail = " ".join(hex(x) for x in words) if words else msg
                 if ok and words == split:
-                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
+                    detail += (" (split: the driver rounded GLSL Fma on doubles twice%s; --fma khr fixes it)"
+                               % ("" if name.endswith("_rt") else " when folding the constants"))
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
@@ -1160,20 +1203,21 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
-                      "cs_dpp_bound", "cs_dpp_w64",
+                      "cs_dpp_bound", "cs_dpp_cmp", "cs_dpp_w64",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
-                      "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
+                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w64x_partial_swizzle", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
+"cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_w64x_cmp_sdst", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec", "cs_w32_exec_computed", "cs_w64_exec_computed"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
+                "cs_smem_vcc_base": CS_SMEM_VCC,
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
                 # SHADER-52: wave32 lane select & 31 (40 → 8)
@@ -1207,6 +1251,12 @@ def run_suite(a, work: str) -> int:
                 # ds_wrxchg*_rtn_b64, ds_or_rtn_b64, ds_min_f32, ds_max_rtn_f32 (cs_lds_xchg64_ext.asm header)
                 "cs_lds_xchg64_ext": [0x11110003, 0x33333333, 0xF00FF000, 0x04030201,
                                     0x40302010, 0x70500705, 0x3FC00000, 0x80000000],
+                # ds_wrxchg2_rtn_b32's pair cases and ds_wrxchg2st64_rtn_b32
+                # (cs_w32_wrxchg2_ext.asm / cs_w32_wrxchg2st64.asm headers)
+                "cs_w32_wrxchg2_ext": [0x77777777, 0x88880008, 0x99990009, 0xDEADBEEF,
+                                      0xAAAAAAAA, 0xBBBBBBBB, 0x12341234, 0x56785678],
+                "cs_w32_wrxchg2st64": [0x33333333, 0x44444444, 0x55550005, 0x66660006,
+                                      0xB0B00084, 0xB0B00088, 0xB0B00140, 0xB0B002C0],
                 # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
                 "cs_lds_atomics_ext": [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
                                        0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700],
@@ -1223,6 +1273,7 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bound": [10, 10, 11, 12, 13, 14, 15, 16],
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
+                "cs_dpp_cmp": [3, 2, 3, 2, 1, 0, 1, 0],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
                 # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
                 # without it
@@ -1252,6 +1303,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
                 "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
+                "cs_w64x_partial_swizzle": [508, 523, 0, 0, 528, 0, 531, 0],   # swizzle from a missing lane: 0
                 "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
                 # ds_permute_b32 in a 20-thread wave32: a never-launched source lane sends nothing (.asm header)
                 "cs_w32_partial_permute": [0, 29, 127, 0, 1, 0, 134, 113],
@@ -1267,6 +1319,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
                 "cs_w64x_andn2_exec": [1, 16, 32, 4144, 2052, 3, 8, 1544],   # s_andn2_saveexec/wrexec_b64 (.asm header)
                 "cs_w64x_saveexec_b64": [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171],   # .asm header
+                "cs_w64x_cmp_sdst": [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5],             # .asm header
                 "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: needs 32 lanes
                 # SHADER-91: s_barrier sites in different wave-uniform branches meet (cs_barrier_divergent.asm)
                 "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
@@ -1286,21 +1339,23 @@ def run_suite(a, work: str) -> int:
             # as check.py does, where the device has none
             # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
             # translated with --wave64-emulate and run on any subgroup size.
-            # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) can't have full subgroups: they ask for
-            # size 64 without them.
+            # cs_w64x_partial, cs_w64x_partial_scmp and cs_w64x_partial_swizzle (40-thread groups) can't have full
+            # subgroups: they ask for size 64 without them. With LEONIDA_W64_EMULATE=1 they ask for 32, the width the
+            # emulation is for, as check.py's partial_wave_test does. RADV defaults compute to 64, and there
+            # cs_w64x_partial_swizzle came out right even before its missing-lane reads were fixed; at 32 it did not.
             emulated = w64_emulated()
-            partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
+            partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp", "cs_w64x_partial_swizzle")
             wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
-                                  "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
+                                  "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec",
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_cmp", "cs_w32_andn2_exec",
                                   "cs_w32_exec_computed") and not emulated and not partial
-            if partial and not emulated:
-                cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
+            if partial:
+                cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="32" if emulated else "64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
@@ -1311,7 +1366,7 @@ def run_suite(a, work: str) -> int:
                     continue
                 if rc == 0:
                     skip = wave32_lane_skip(msg)
-            if skip is None and name in WAVE32_PIN_DUMPS:
+            if rc == 0 and skip is None and name in WAVE32_PIN_DUMPS:
                 # the device may not be able to run the wave size this fixture was written for (a 64-only device
                 # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
                 skip = subgroup_pin_skip(msg, cs_env)
@@ -1322,17 +1377,18 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
                                                              "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                                                             "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_signed_zero_nan"))
+                                                             "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_signed_zero_nan"))
                 if ok and None in want:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
-        elif name == "cs_imgstore":
-            rc, msg = run_cmd([vk_store, spv])
+        elif name in IMAGE_STORE_CASES:
+            rc, msg = run_cmd([vk_store, spv, *IMAGE_STORE_CASES[name]])
             results.append((name, *helper_result(rc, msg)))
-        elif name in ("cs_imgload", "cs_imgload_tfe", "cs_imgload_d16", "cs_imgload_d16_tfe", "cs_sample_lz_int_d16"):
-            rc, msg = run_cmd([vk_store, spv, "load" if name in ("cs_imgload", "cs_imgload_tfe") else "load-d16"])
-            results.append((name, *helper_result(rc, msg)))
+        elif name == "cs_texture_uav":
+            problem = texture_uav_test(a.build, spv)
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "D3D12/Vulkan storage-image readback matched"))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

@@ -386,7 +386,9 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
         export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
         endpgm = [0x00, 0x00, 0x81, 0xBF]
-        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # the word from the finding, as llvm-mc leaves it
+        # The finding's word with clamp set: the measured op_sel 2 / op_sel_hi 5 form is now decoded from the blob
+        # (rdna2spirv.skipped_form), this one is not.
+        gap = [0x00, 0xD0, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)
@@ -421,7 +423,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         # code range the header declares, so the path runs into them as well
         mov0 = [0xF2, 0x02, 0x00, 0x7E]
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
-        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
+        gap = [0x00, 0xD0, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # clamp set: not a form restored from the blob
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)

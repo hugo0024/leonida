@@ -37,10 +37,47 @@ SDL3 is available in one of these ways:
 - **A local copy of that tarball**: extract it and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=<path to SDL3-3.4.20>`; it is
   built the same way, without a download.
 
-Without any of these, or with `-DLEONIDA_SDL3=OFF`, configure prints a message and `gta6rt` is built without the shim:
-it has no `GameInputCreate`, as before, so the loader binds it to the host's `GameInput.dll` or the unimplemented
-thunk. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
-than failing.
+Without any of these, or with `-DLEONIDA_SDL3=OFF`, configure prints a message and `gta6rt` is built without the SDL3
+shim. It links `runtime/shims/gameinput_no_sdl.cpp` instead, which still serves `GameInputCreate` (by name and as
+`gameinput.dll!#1`): with no devices, or with `LEONIDA_INPUT_SCRIPT` set with one scripted pad (see
+[Scripted input without SDL3](#scripted-input-without-sdl3)). `gameinput_test` and `gameinput_probe` are not built,
+and CTest lists `gameinput` and `gameinput_script` as not run (disabled) rather than failing; `gameinput_no_sdl` and
+`gameinput_no_sdl_script` run instead.
+
+### Scripted input without SDL3
+
+The Windows artifacts of CI and offline builds have no SDL3. Without a device, the title waits at its first "press A"
+prompt forever, so no headless or CI run could get past it. With `LEONIDA_INPUT_SCRIPT` set, such a build serves one
+scripted pad, driven by the script alone:
+
+- **The device:** an Xbox One gamepad named `Scripted pad (Leonida)`, connected from the first `GameInputCreate`. It
+  is reported by `RegisterDeviceCallback` enumeration (blocking on the caller's thread, async from a thread of the
+  shim, or through `IGameInputDispatcher::Dispatch` once the title made a dispatcher) and found by `FindDeviceFromId`.
+  It is already connected, so a callback registered without enumeration hears nothing.
+- **The readings:** `GetCurrentReading`, `GetNextReading` and `GetPreviousReading`, with gamepad, UI navigation,
+  controller axis and controller button state. A reading is taken when the title asks for one and the script's state
+  has changed since the last, so no thread polls; the history keeps the last 64 readings.
+- **The timeline:** the same as with SDL3 (`runtime/shims/gameinput_script.h` holds the parser, the timeline and the
+  log lines for both): seconds from the first `GameInputCreate`, each press held 300 ms (or its own `:hold`, see
+  `LEONIDA_INPUT_SCRIPT` below), then released.
+- **Not served:** reading callbacks, aggregate devices, rumble and every other device. Those slots answer `E_NOTIMPL`
+  and log the slot once. Controllers and the [keyboard pad](#keyboard-pad) still need SDL3.
+
+The start of the run logs one line with the counts, and each press logs the same lines as with SDL3:
+
+```text
+[rt] gameinput: served without SDL3: one scripted pad for LEONIDA_INPUT_SCRIPT (3 scripted press(es), 0 rejected); controllers and the keyboard pad need SDL3
+[rt] gameinput: scripted press of button 0 at 40.0 s
+[rt] gameinput: press a@40.0 (Scripted pad (Leonida))
+```
+
+A press is logged when the title reads it, so a press the title never reads is not logged. `LEONIDA_INPUT_LOG=0`
+turns the `press` lines off. Without `LEONIDA_INPUT_SCRIPT`, the shim serves no devices and answers `E_NOTIMPL` for
+every slot past `Release`, as before.
+
+`LEONIDA_INPUT_FILE=<path>` drives a run whose display takes no keyboard input (a headless session): every line
+appended to that file names one button of the script's table (`a`, `down`, ...) and becomes a press at once, held
+like a scripted one. The file is read again at most every 250 ms. It is for local runs only.
 
 `scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
 C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
@@ -81,7 +118,8 @@ The title reads gamepads only, so keyboard input has to arrive as a gamepad. Wit
 shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
 every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
 reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is off by
-default.
+default. If SDL fails to attach or open the keyboard pad, the shim retries after one second while the pad is
+enabled. Only the first failure in a continuous series is logged; turning the pad off and back on retries immediately.
 
 | key | button |
 |---|---|
@@ -125,9 +163,9 @@ owns the game's window, which is the title's, not the shim's.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
 subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
-window of this process is in the foreground, so typing in another application presses nothing, and every button,
-stick and trigger is released when focus moves away (the cursor is read afresh when focus returns, so the right
-stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
+window of this process is in the foreground. Losing focus releases keyboard and mouse input. The cursor is read
+afresh on return so the right stick does not jump. Scripted presses run with or without focus for unattended runs.
+`LEONIDA_KEYBOARD_PAD=always` reads physical input whatever has focus; a console tool such as
   `gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
 - Force feedback and haptics run through a fake haptic backend (`rt::gameinput::set_haptic_source`), because SDL's
   virtual joysticks report no haptics: the motor count, axes and effect flags a wheel reports, and a pad without SDL
@@ -302,6 +340,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
+| `LEONIDA_INPUT_SCRIPT` | unset | Comma-separated `button@seconds` entries, e.g. `a@2,a@4,start@6`. With SDL3 they drive the keyboard pad, which has to be enabled; without SDL3 they drive [one scripted pad](#scripted-input-without-sdl3), the only device. The first pad update (without SDL3, the first `GameInputCreate`) reads the script once at startup and starts the clock. `reload_config()` does not reread it. Each press lasts 300 ms, or `hold` seconds when the entry is `button@seconds:hold` (more than 0, at most 600). With SDL3 a press then stays down until the title has read the pads six times since it began, but never past 5 s from its start (or its hold, if longer). A title reads its pad once a frame, so at a few seconds a frame a 300 ms press can fall between two reads and never arrive: on the retail title's "Couldn't autosave" prompt, three 300 ms `b` presses did nothing, while 120 presses 0.5 s apart got through; one `b@1100:3` replaces them. Buttons are `a b x y start back lb rb up down left right`. Spaces around entries are allowed. Empty entries, unknown buttons, invalid times (including negative or non-finite values) and invalid holds (0 or less, more than 600, not a number) are counted and ignored. |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
@@ -327,8 +366,6 @@ The API surface:
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, raw report (pads opened through HID, see [Raw HID](#raw-hid)) | keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState`, `CreateRawDeviceReport`, `GetRawDeviceFeature`, `SetRawDeviceFeature`, `SendRawDeviceOutput` (pads opened through HID) | `SendRawDeviceOutputWithResponse`, `ExecuteRawDeviceIoControl`, exclusive raw access, power off, input synchronization (no-ops) |
 | `IGameInputRawDeviceReport` | device, report info (kind, id, size), raw data size, get and set raw data | item values (`Get/Set/ResetItemValue`, `ResetAllItems` answer false: no item tables) |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
-| `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState` | raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch` (with its quota), `OpenWaitHandle` | |
 
 `CreateAggregateDevice` takes exactly one of the keyboard, mouse, gamepad, arcade stick, flight stick or racing wheel
@@ -458,6 +495,14 @@ rests on a transcription rather than on a side-by-side compile.
   button, the touchpad, a trigger or a stick, stick drift and a one-count mouse jitter ignored, a real mouse movement
   counted, the 300 ms window on the real clock, and `LEONIDA_PROMPTS` forcing, changing, ignoring an unknown value
   and clearing.
+- `gameinput_no_sdl_test` (CTest, only in a build without SDL3, no controller): `gameinput_no_sdl` checks the
+  identity-only object (both names served, `AddRef`/`Release`, `E_NOTIMPL` without touching the out-parameter).
+  `gameinput_no_sdl_script` sets `LEONIDA_INPUT_SCRIPT` with overlapping presses, a mixed-case name, `rsup` and three
+  rejected entries, puts the shim on a fake clock and checks the scripted pad: blocking, async and dispatcher
+  enumeration (and none without enumeration, for another status or another kind), the device info, `FindDeviceFromId`,
+  the buttons, UI navigation and right stick read at chosen times (held for 0.3 s, a later press of the same button
+  not cut short, nothing after the script), no new reading without a change, `GetPreviousReading` and
+  `GetNextReading`, no motion, and reading callbacks answering `E_NOTIMPL`.
 - `gameinput_test` (CTest, no controller): turns SDL's real backends off and drives the shim through
   `rt::shims::find` with SDL virtual joysticks, an Xbox-style pad with trigger motors, a DualSense (Sony
   `054c:0ce6`) and a pad without trigger motors. It checks enumeration and device callbacks, the button, stick,

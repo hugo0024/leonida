@@ -80,6 +80,36 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 words = _literal_words(f.read(), 7, 1)
             self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
 
+    def test_cli_refuses_output_that_aliases_source(self):
+        for alias in ("same", "dotdot", "hardlink", "symlink"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as directory:
+                src = os.path.join(directory, "source.spvasm")
+                original = b"OpNop\n"
+                with open(src, "wb") as f:
+                    f.write(original)
+                if alias == "same":
+                    dst = src
+                elif alias == "dotdot":
+                    os.mkdir(os.path.join(directory, "sub"))
+                    dst = os.path.join(directory, "sub", "..", "source.spvasm")
+                else:
+                    dst = os.path.join(directory, f"{alias}.spv")
+                    try:
+                        if alias == "hardlink":
+                            os.link(src, dst)
+                        else:
+                            os.symlink(src, dst)
+                    except OSError as exc:
+                        self.skipTest(f"{alias} is unavailable: {exc}")
+                result = subprocess.run(
+                    [sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("output must not overwrite the source", result.stderr)
+                with open(src, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
     def test_instruction_boundaries_follow_tokens_across_physical_lines(self):
         canonical = (
             "OpCapability Shader\n"
@@ -167,6 +197,49 @@ class SpirvAsmUnitTests(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 self.assertTrue(spirv_asm.assemble("%uint = OpTypeInt 32 0\n" + body))
+
+    def test_named_shader_debuginfo_with_forward_references(self):
+        # A function refers to its parent composite, which in turn lists the function as a member.
+        asm = """OpCapability Shader
+OpExtension "SPV_KHR_non_semantic_info"
+OpExtension "SPV_KHR_relaxed_extended_instruction"
+%dbg = OpExtInstImport "NonSemantic.Shader.DebugInfo.100"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%name = OpString "demo"
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%fn = OpTypeFunction %void
+%src = OpExtInst %void %dbg DebugSource %name %name
+%unit = OpExtInst %void %dbg DebugCompilationUnit %zero %zero %src %zero
+%type = OpExtInstWithForwardRefsKHR %void %dbg DebugTypeFunction %zero %class
+%method = OpExtInstWithForwardRefsKHR %void %dbg DebugFunction %name %type %src %zero %zero %class %name %zero %zero
+%class = OpExtInst %void %dbg DebugTypeComposite %name %zero %src %zero %zero %unit %name %zero %zero %method
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        numeric = asm
+        for name, opcode in (("DebugSource", 35), ("DebugCompilationUnit", 1), ("DebugTypeFunction", 8),
+                             ("DebugFunction", 20), ("DebugTypeComposite", 10)):
+            numeric = numeric.replace(f" %dbg {name} ", f" %dbg {opcode} ")
+        spv = spirv_asm.assemble(asm)
+        self.assertEqual(spv, spirv_asm.assemble(numeric))
+        _validate(spv)
+        if SPIRV_AS:
+            with tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "debug.spvasm")
+                out = os.path.join(tmp, "debug.spv")
+                with open(src, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(asm)
+                subprocess.run([SPIRV_AS, "--target-env", "vulkan1.2", src, "-o", out],
+                               check=True, capture_output=True)
+                with open(out, "rb") as f:
+                    reference = f.read()
+                self.assertEqual(spv[:8] + spv[12:], reference[:8] + reference[12:])
 
     def test_header_and_target_env_versions(self):
         asm = (

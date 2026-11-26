@@ -1668,6 +1668,29 @@ Measured on an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003, ROCm wheel
 each value is staged once, and that the kernels assemble for gfx1031. A fake oracle plays the GPU to check the exit
 codes. On a GFX10 GPU the test runs UNORM8 and checks the controls.
 
+### d16 rounding of image loads and samples (`tools/d16_image_probe.py`)
+
+The image counterpart to `tools/d16_format_probe.py` checks how a GFX10 GPU (RDNA1/RDNA2, through `tools/hw_oracle`)
+rounds d16 image results to f16 across three paths: `image_load` (unnormalized integer coordinates), point-filtered
+`image_sample_lz`, and bilinear `image_sample_lz` (`--frac` texels to the right of the texel centre), in wave32 and
+wave64. It covers `unorm8`, `snorm8`, `unorm16`, `snorm16`, `float16` (control: returns its own bits), and `float32`
+(1,024 patterns starting with exact f16 halfway points such as `0x3f7ff000` and `0x3f7fb000` plus their neighbours).
+Point loads and point samples are compared against the candidate rules of `tools/d16_format_probe.py` (`rte`,
+`f32_rte`, and their toward-zero and denormal-flushing variants), while bilinear d16 samples are compared against the
+hardware's own f32 bilinear sample rounded to nearest even or toward zero.
+
+```
+python -I tools/d16_image_probe.py --formats unorm8,unorm16 --waves 32,64 --frac 0.5 --json out.json
+python -I tools/d16_image_probe.py --hw-arch gfx1031 --json out.json
+python -I tools/d16_image_probe.py --self-test
+python -I tests/test_d16_image_probe.py
+```
+
+Exit status is 0 when the sweep ran, 1 when wave32 and wave64 disagree, 2 on a harness or control error (f32 load
+mismatch, point sample differing from load, `float16` mismatch, or misaligned texture), and 77 when the hardware oracle
+is unavailable or the GPU is not GFX10. `tests/test_d16_image_probe.py` covers the rules, texel generators, descriptors,
+and exit codes without a GPU or game files.
+
 ### Widening a 16-bit float NaN in a typed buffer load (`tools/f16_widen_probe.py`)
 
 A typed buffer load of a half NaN had never been measured: `tools/mem_diff.py` decoded 16_FLOAT with
@@ -1997,7 +2020,7 @@ the two wave sizes agree on every word. `tools/fma_mix_probe.py --oracle hw` (th
 `tests/semantic/spirv_mini_interp.py`, then compared with the hardware under the MODE the translator assumes for the
 game (IEEE 0, DX10_CLAMP 1, f32 denormals flushed, f16 denormals kept). It gives the same word for the float
 constants in every `op_sel`/`op_sel_hi` combination, for the integer constants as f16 halves, for clamp on values that
-are not NaN, and for the f16 denormals. It differs in five ways, none fixed here:
+are not NaN, and for the f16 denormals. It differs in five ways; item 2 is fixed since 2026-11-24:
 
 1. **f16 omod.** The translator applies `mul:2`/`mul:4`/`div:2` to every f16 result. The hardware ignores them in this
    MODE (24 words: `v_add/mul/fma/fmac/exp/rcp_f16`). `v_cvt_f16_f32` drops its omod and clamp today, so its omod
@@ -2007,6 +2030,7 @@ are not NaN, and for the f16 denormals. It differs in five ways, none fixed here
    when "output denormals" are off, the `SIFoldOperands.cpp` comment quoted above). That count needs the game files.
 2. **clamp of a NaN.** The interpreter refuses `FClamp` with a NaN operand, which GLSL.std.450 leaves undefined. The
    hardware gives +0 with DX10_CLAMP 1, for `v_fmac_f16`, `v_fma_mixlo_f16` and `v_fma_mix_f32` alike (SHADER-186).
+   **Fixed since 2026-11-24:** `Gen.clamp_mods` selects +0 for a NaN before `FClamp` (`tests/semantic/test_vop3_clamp_nan.py`).
 3. **Mix-op rounding.** The hardware rounds once (the section above).
 4. **f32 denormal operands of the mix ops.** They are not flushed with `denorm_mode_32 = 0`: `0x00000001`, `0x807fffff`
    and the integer constants `1` and `64` used as f32 give the denormal, where the hardware gives a zero of its sign
@@ -2327,6 +2351,27 @@ same `198` shaders with `--bary-fallback --f16-interp-fallback` gave `153` OK on
 completing draws (`89` non-clear exact + `64` clear-only exact across `573/573` targets) bit-for-bit identical under
 `ps_sweep.py compare --exact`. All `3` whole-corpus shaders combining raw barycentrics and `v_interp_*_f16` also draw
 bit-for-bit identically (`3/3` draws, `11/11` targets) against `default` on the RX 6650 XT.
+
+### Op-scoped mutation testing for `tests/semantic` (`tools/semantic_mutants.py`)
+
+`tools/semantic_mutants.py` checks which one-line bugs in `tools/rdna2spirv.py` a given `tests/semantic` file would
+miss. You scope the slice by instruction branch (`--op`), translator method (`--function`), or 1-based line range
+(`--lines`); it generates one-line mutants (swapped SPIR-V and `GLSL.std.450` opcode pairs, comparison polarity and
+signedness flips, `self.cu(N)` off-by-one constants, swapped `OpSelect` arms, and duplicated trailing operands) in a
+private temporary copy of `tools/` and runs the test file against each copy through `LEONIDA_TOOLS_DIR` (the same hook
+used by `tests/semantic/test_mutations.py`), leaving the repository untouched.
+
+```
+python -I tools/semantic_mutants.py tests/semantic/test_alu_sad.py --op v_sad_u8
+python -I tools/semantic_mutants.py tests/semantic/test_alu_sad.py --op v_sad_u8 --list
+python -I tools/semantic_mutants.py tests/semantic/test_alu_sad.py --op v_sad_u8 --timeout 120
+python -I tests/test_semantic_mutants.py
+```
+
+Any mutant the test file still passes is reported as `SURVIVED` (read each lead before adding cases, since some mutants
+are equivalent). Exit status is 0 when every mutant is caught, 1 when any survives, and 2 on a usage error or when the
+unmutated baseline fails. Synthetic only (no GPU or game files); `tests/test_semantic_mutants.py` covers mutant
+generation, scoping, and CLI exit codes.
 
 ## Coverage plan and cost
 

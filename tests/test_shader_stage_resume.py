@@ -93,6 +93,10 @@ class ShaderStageResumeTest(unittest.TestCase):
                 json.dump([{"file": "s0.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "s0"}], f)
+            elif p == os.path.join(self.spirv, "index.json"):
+                with open(os.path.join(self.dxbc, "index.json"), encoding="utf-8") as source:
+                    carved = json.load(source)
+                json.dump({os.path.splitext(entry["file"])[0]: {"stage": "vs"} for entry in carved}, f)
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
@@ -528,8 +532,8 @@ class ShaderStageResumeTest(unittest.TestCase):
 
 
 class TranslationSourcesTest(unittest.TestCase):
-    def test_the_list_covers_every_local_module_the_translator_imports(self):
-        seen, todo = set(), ["rdna2spirv"]
+    def test_the_list_covers_the_translator_and_native_catalog_imports(self):
+        seen, todo = set(), ["rdna2spirv", "native_pso_hashes"]
         while todo:
             name = todo.pop()
             if name in seen:

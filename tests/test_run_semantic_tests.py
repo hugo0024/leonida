@@ -9,7 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import _thread
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -21,6 +24,22 @@ PASS = "import unittest\nimport helper\nclass T(unittest.TestCase):\n    def tes
 FAIL = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertEqual(1, 2, 'boom-msg')\n"
 BROKEN = "import no_such_module_anywhere\n"
 HANG = "import time\nprint('before-sleep-marker', flush=True)\ntime.sleep(60)\n"
+RAN0 = ("import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+        "        print('Ran 0 tests in 0.000s', flush=True)\n")
+RAN0_AT_EXIT = ("import atexit\nimport unittest\natexit.register(lambda: print('Ran 0 tests in 0.000s'))\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+# An atexit handler that writes to stderr after unittest's own summary: the count comes from unittest's result
+# object, so the late line cannot change it.
+ATEXIT_STDERR = ("import atexit\nimport sys\nimport unittest\n"
+                 "atexit.register(lambda: unittest.TextTestRunner(stream=sys.stderr, verbosity=0)"
+                 ".run(unittest.TestSuite()))\n"
+                 "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+LATE_SUMMARY = ("import atexit\nimport sys\nimport unittest\n"
+                "atexit.register(lambda: print('Ran 7 tests in 0.000s', file=sys.stderr))\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+# A test that runs a nested unittest runner: that runner writes its own summary to stderr while the test runs.
+NESTED = ("import sys\nimport unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+          "        unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(unittest.TestSuite())\n")
 
 
 def suite(tmp, files):
@@ -56,6 +75,39 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("TIMED OUT after 1 s: test_hang", result.stdout)
             self.assertIn("3 files, 4 tests, 1 files failed", result.stdout)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_the_count_comes_from_unittest_not_from_a_test_line(self):
+        # A test may print a line of the same shape as unittest's own summary. unittest writes its summary to stderr
+        # and a test's own output to stdout, so the count comes from stderr: in the merged output it was whichever
+        # line came first, which depended on stdout buffering.
+        for source in (RAN0, RAN0_AT_EXIT):
+            with self.subTest(source=source.split(chr(10))[0]), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"test_counts.py": source})
+                result = cli(tmp, "-j", "2")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+                self.assertNotIn("no tests ran", result.stdout)
+
+    def test_the_count_comes_from_unittest_not_from_a_nested_runner(self):
+        # A test that runs a nested unittest runner writes that runner's summary ("Ran 0 tests in ...") to stderr
+        # while the test runs, before unittest writes its own. The count must come from unittest's own summary.
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_counts.py": NESTED})
+            result = cli(tmp, "-j", "2")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+            self.assertNotIn("no tests ran", result.stdout)
+
+    def test_the_count_comes_from_the_result_object_not_from_a_late_summary(self):
+        # A summary written to stderr after unittest's own - an atexit handler that runs a nested runner, or one
+        # that prints a line of that shape - must not change the count: it comes from unittest's result object.
+        for source in (ATEXIT_STDERR, LATE_SUMMARY):
+            with self.subTest(source=source.split(chr(10))[0]), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"test_counts.py": source})
+                result = cli(tmp, "-j", "2")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+                self.assertNotIn("no tests ran", result.stdout)
 
     def test_serial_timeout_keeps_discover_output_and_names_the_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +284,130 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 1)
             self.assertIn("no test*.py files", out)
+
+    def test_parallel_interrupt_stops_active_processes_and_cancels_queued_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
+            mod_template = (
+                "import os, time, unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_run(self):\n"
+                "        with open(r'{marker}', 'w') as f: f.write('1')\n"
+                "        time.sleep(10)\n"
+            )
+            files = {
+                f"test_{i}.py": mod_template.format(marker=os.path.join(marker_dir, f"m_{i}.txt"))
+                for i in range(4)
+            }
+            suite(tmp, files)
+
+            def trigger():
+                start = time.monotonic()
+                while time.monotonic() - start < 8:
+                    if len(os.listdir(marker_dir)) >= 2:
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.05)
+                _thread.interrupt_main()
+
+            threading.Thread(target=trigger, daemon=True).start()
+            out, err = io.StringIO(), io.StringIO()
+            t0 = time.monotonic()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = r.main([tmp, "-j", "2"])
+            elapsed = time.monotonic() - t0
+
+            self.assertEqual(code, 130)
+            self.assertIn("interrupted", err.getvalue())
+            self.assertNotIn("files failed", out.getvalue())
+            self.assertNotIn("4 files,", out.getvalue())
+            started = os.listdir(marker_dir)
+            self.assertEqual(len(started), 2, f"Expected 2 started modules, got {started}")
+            self.assertLess(elapsed, 5.0)
+
+    def test_serial_interrupt_returns_130_and_prints_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
+            marker = os.path.join(marker_dir, "serial_marker.txt")
+            content = (
+                "import os, time, unittest\n"
+                "class T(unittest.TestCase):\n"
+                f"    def test_run(self):\n"
+                f"        with open(r'{marker}', 'w') as f: f.write('1')\n"
+                "        time.sleep(10)\n"
+            )
+            suite(tmp, {"test_serial_hang.py": content})
+
+            def trigger():
+                start = time.monotonic()
+                while time.monotonic() - start < 8:
+                    if os.path.exists(marker):
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.05)
+                _thread.interrupt_main()
+
+            threading.Thread(target=trigger, daemon=True).start()
+            out, err = io.StringIO(), io.StringIO()
+            t0 = time.monotonic()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = r.main([tmp, "-j", "1"])
+            elapsed = time.monotonic() - t0
+
+            self.assertEqual(code, 130)
+            self.assertIn("interrupted", err.getvalue())
+            self.assertLess(elapsed, 5.0)
+
+    def test_terminate_active_processes_kills_registered_processes(self):
+        cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+        p1 = subprocess.Popen(cmd)
+        p2 = subprocess.Popen(cmd)
+        r._register_process(p1)
+        r._register_process(p2)
+        try:
+            self.assertIsNone(p1.poll())
+            self.assertIsNone(p2.poll())
+            r._terminate_active_processes()
+            self.assertIsNotNone(p1.poll())
+            self.assertIsNotNone(p2.poll())
+        finally:
+            for p in (p1, p2):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group SIGINT test")
+    def test_posix_sigint_cancels_queued_modules_and_stops_runner(self):
+        import signal
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
+            mod_template = (
+                "import os, time, unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_run(self):\n"
+                "        with open(r'{marker}', 'w') as f: f.write('1')\n"
+                "        time.sleep(8)\n"
+            )
+            files = {
+                f"test_{i}.py": mod_template.format(marker=os.path.join(marker_dir, f"m_{i}.txt"))
+                for i in range(5)
+            }
+            suite(tmp, files)
+
+            script = os.path.join(ROOT, "scripts", "run_semantic_tests.py")
+            proc = subprocess.Popen([sys.executable, "-I", script, tmp, "-j", "2"],
+                                    start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True)
+            start = time.monotonic()
+            while time.monotonic() - start < 5:
+                if len(os.listdir(marker_dir)) >= 2:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=5)
+            self.assertIn(proc.returncode, (130, -signal.SIGINT, 128 + signal.SIGINT))
+            self.assertIn("interrupted", stderr)
+            self.assertNotIn("5 files,", stdout)
+            self.assertEqual(len(os.listdir(marker_dir)), 2)
 
 
 if __name__ == "__main__":

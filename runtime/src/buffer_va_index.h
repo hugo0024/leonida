@@ -83,8 +83,19 @@ public:
         return found;
     }
 
+    // find() can return a shorter alias. Only a complete range can serve the view without new backing.
+    bool covers(std::uint64_t va, std::uint64_t bytes) const {
+        Hit hit{};
+        return find(va, hit, bytes) && bytes <= hit.size - (va - hit.start);
+    }
+
     std::size_t size() const { return ranges_.size(); }
     std::uint64_t longest() const { return longest_; }
+    // f(first VA, bytes) for every range, in VA order.
+    template <class F>
+    void for_each(F&& f) const {
+        for (const auto& [key, bytes] : ranges_) f(key.first, bytes);
+    }
 
 private:
     static constexpr Id max_id() { return ~Id(0); }
